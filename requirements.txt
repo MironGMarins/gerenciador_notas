@@ -1,0 +1,11 @@
+# requirements.txt
+
+# Para o web app e a interface
+streamlit
+
+# Para manipulação de dados
+pandas
+
+gspread
+
+openpyxl

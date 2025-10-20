@@ -1,0 +1,13 @@
+# Ignorar o ambiente virtual
+.venv/
+
+# Ignorar arquivos de cache do Python
+__pycache__/
+*.pyc
+
+# NUNCA ENVIAR ESTE ARQUIVO!
+google_credentials.json
+
+.streamlit/
+# Ignorar arquivos do sistema operacional
+.DS_Store
