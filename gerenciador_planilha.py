@@ -209,10 +209,8 @@ def gerar_arquivo_excel(df_geral, df_completo, lideres, df_equipes):
         nomes_ativos_lower = {str(nome).lower() for nome in nomes_ativos}
 
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # --- Aba 1: Relatório Geral (USA O DATAFRAME COMPLETO) ---
         df_completo.to_excel(writer, sheet_name='Relatório Geral', index=False)
 
-        # --- Aba 2: Soma Geral (com filtro de ativos) ---
         df_calculo = df_completo.copy()
         colunas_de_notas = ['Peso'] + lideres
         for col in colunas_de_notas:
@@ -252,7 +250,6 @@ def gerar_arquivo_excel(df_geral, df_completo, lideres, df_equipes):
             start_row_total = start_row_pontos + len(df_pontos_lideranca_filtrado) + 4
             pontuacao_total_filtrado.to_excel(writer, sheet_name='Soma Geral', index=False, startrow=start_row_total)
 
-        # --- Aba 3: Soma Semanal (com filtro de ativos) ---
         df_semanal = df_calculo.copy()
         df_semanal = df_semanal[pd.notna(df_semanal['Data Final'])]
         
@@ -374,7 +371,13 @@ if df_notas is not None:
     df_editado = st.data_editor(
         df_para_exibir, 
         disabled=colunas_desabilitadas,
-        key="editor_notas"
+        key="editor_notas",
+        column_config={
+            "Link": st.column_config.LinkColumn(
+                "Link da Tarefa",
+                display_text="Abrir ↗"
+            )
+        }
     )
     
     st.markdown("---")
