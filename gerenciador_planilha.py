@@ -6,6 +6,7 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 import io
+import requests # Adicionado para chamadas de API
 
 # ==============================================================================
 # CONFIGURAÇÃO DA PÁGINA
@@ -21,6 +22,7 @@ st.set_page_config(
 PLANILHA_ORIGEM_NOME = "Total BaseCamp"
 PLANILHA_NOTAS_NOME = "Total BaseCamp para Notas"
 PLANILHA_EQUIPES_NOME = "Equipes"
+PLANILHA_SENHAS_NOME = "Senhas" # <-- Nova aba para login
 
 # ==============================================================================
 # AUTENTICAÇÃO E CONEXÃO
@@ -51,6 +53,102 @@ def carregar_aba_de_forma_robusta(worksheet):
     
     return pd.DataFrame(data, columns=headers)
 
+# ==============================================================================
+# --- FUNÇÃO DE LOGIN ---
+# ==============================================================================
+@st.cache_data(ttl=60) # Cache curto para verificação de senha
+def check_credentials(username, password):
+    """Verifica o usuário e senha contra a aba 'Senhas' da planilha."""
+    try:
+        client = autorizar_cliente()
+        if client is None: return False
+        
+        url_da_planilha = st.secrets.get("SHEET_URL")
+        if not url_da_planilha:
+            st.error("URL da planilha (SHEET_URL) não encontrada nos segredos.")
+            return False
+            
+        spreadsheet = client.open_by_url(url_da_planilha)
+        ws_senhas = spreadsheet.worksheet(PLANILHA_SENHAS_NOME)
+        df_senhas = pd.DataFrame(ws_senhas.get_all_records())
+        
+        # Limpa e converte os dados para comparação
+        username = str(username).strip()
+        password = str(password).strip()
+        
+        df_senhas['Usuario'] = df_senhas['Usuario'].astype(str).str.strip()
+        df_senhas['Senha'] = df_senhas['Senha'].astype(str).str.strip()
+
+        # Procura por uma combinação exata
+        match = df_senhas[
+            (df_senhas['Usuario'] == username) & 
+            (df_senhas['Senha'] == password)
+        ]
+        
+        # Retorna True se encontrou pelo menos uma correspondência
+        return not match.empty
+    except Exception as e:
+        st.error(f"Erro ao verificar credenciais: {e}")
+        return False
+
+# ==============================================================================
+# --- FUNÇÃO DA API DO BASECAMP ---
+# ==============================================================================
+def atualizar_basecamp_api():
+    """
+    Função para buscar dados da API do Basecamp e atualizar a planilha de origem.
+    """
+    try:
+        # ==========================================================================
+        ### COLE SEU CÓDIGO DA API DO BASECAMP AQUI ###
+        #
+        # 1. Coloque suas credenciais da API do Basecamp nos segredos do Streamlit
+        #    (ex: st.secrets["basecamp_token"])
+        #
+        # 2. Faça a chamada da API usando a biblioteca 'requests'
+        #    response = requests.get("sua_url_da_api", headers={"Authorization": ...})
+        #    dados_basecamp = response.json()
+        #
+        # 3. Processe a resposta JSON e a transforme em um DataFrame do Pandas.
+        #    O DataFrame final deve ter as mesmas colunas que sua aba "Total BaseCamp".
+        #
+        # --- INÍCIO DO CÓDIGO DE EXEMPLO (SUBSTITUA PELO SEU) ---
+        st.info("Simulando chamada da API do Basecamp...")
+        # Exemplo: Criando uma nova tarefa de exemplo para demonstração
+        nova_tarefa_exemplo = {
+            "ID": [str(pd.Timestamp.now().timestamp()).replace('.', '')], # ID único de exemplo
+            "Tarefa": ["Nova Tarefa via API"],
+            "Encarregado": ["OCTAVIO"],
+            "Data Inicial": [pd.Timestamp.now().strftime('%Y-%m-%d')],
+            "Data Final": [""],
+            "Data Estipulada": [""],
+            "Link": ["https://3.basecamp.com/.../todos/NOVOTODOID"],
+            # Adicione outras colunas conforme necessário, com valores vazios se não aplicável
+            "Observação": [""], "Peso": [""], "Pablo": [""], "Leonardo": [""], "Itiel": [""], "Ítalo": [""]
+        }
+        df_novas_tarefas = pd.DataFrame(nova_tarefa_exemplo)
+        # --- FIM DO CÓDIGO DE EXEMPLO ---
+        # ==========================================================================
+
+        # Atualiza a planilha do Google Sheets com os novos dados
+        client = autorizar_cliente()
+        url_da_planilha = st.secrets.get("SHEET_URL")
+        if not url_da_planilha:
+            st.error("URL da planilha não configurada nos segredos.")
+            return False
+            
+        spreadsheet = client.open_by_url(url_da_planilha)
+        worksheet_origem = spreadsheet.worksheet(PLANILHA_ORIGEM_NOME)
+        
+        # Anexa as novas linhas ao final da planilha
+        worksheet_origem.append_rows(df_novas_tarefas.values.tolist(), value_input_option='USER_ENTERED')
+
+        return True
+
+    except Exception as e:
+        st.error(f"Erro ao atualizar dados do BaseCamp: {e}")
+        return False
+        
 # ==============================================================================
 # FUNÇÕES DE LÓGICA DE NEGÓCIO
 # ==============================================================================
@@ -281,120 +379,159 @@ def gerar_arquivo_excel(df_geral, df_completo, lideres, df_equipes):
     return processed_data
 
 # ==============================================================================
-# INTERFACE PRINCIPAL DO APP
+# --- LÓGICA PRINCIPAL DO APP COM LOGIN ---
 # ==============================================================================
-col_titulo, col_botao = st.columns([3, 1])
-with col_titulo:
-    st.title("📝 Gerenciador de Notas de Tarefas")
-    st.write("Sincronize tarefas, edite notas, promova líderes e exporte relatórios.")
 
-df_notas, df_equipes, encarregados, lideres = sincronizar_e_processar_dados()
+# Inicializa o estado de autenticação
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
 
-with st.sidebar:
-    st.image("media portal logo.png", width=200)
-
-    st.header("Filtros e Ordenação")
+# --- TELA DE LOGIN ---
+if not st.session_state.authenticated:
+    st.title("🔒 Login - Gerenciador de Notas")
+    st.write("Por favor, insira suas credenciais para acessar o aplicativo.")
     
-    status_filtro = st.selectbox("Filtrar por Status do Encarregado:", ["Todos", "Ativos", "Desativados", "Não Listados"])
-
-    nomes_para_filtrar = []
-    if df_equipes is not None and df_notas is not None:
-        if status_filtro == 'Todos': nomes_para_filtrar = encarregados
-        elif status_filtro == 'Ativos':
-            nomes_ativos = df_equipes[df_equipes['Status'] == 'Ativo']['Nome'].tolist()
-            nomes_para_filtrar = [nome for nome in encarregados if nome in nomes_ativos]
-        elif status_filtro == 'Desativados':
-            nomes_desativados = df_equipes[df_equipes['Status'] == 'Desativado']['Nome'].tolist()
-            nomes_para_filtrar = [nome for nome in encarregados if nome in nomes_desativados]
-        elif status_filtro == 'Não Listados':
-            nomes_listados = df_equipes['Nome'].tolist()
-            nomes_para_filtrar = [nome for nome in encarregados if nome not in nomes_listados]
-    
-    filtro_encarregado = st.multiselect("Filtrar por Encarregado:", ["Todos"] + sorted(nomes_para_filtrar), default="Todos")
-    
-    st.write("Ordenar por:")
-    opcoes_ordem = ['Encarregado', 'Data Inicial', 'Data Final', 'Tarefa']
-    ordem_primaria = st.selectbox("Fator Primário:", opcoes_ordem, index=0)
-    ordem_secundaria = st.selectbox("Fator Secundário:", opcoes_ordem, index=1)
-    
-    st.header("Gerenciar Líderes")
-    
-    if df_notas is not None and df_equipes is not None:
-        encarregados_nao_lideres = sorted(list(set(encarregados) - set(lideres)))
-        if encarregados_nao_lideres:
-            novo_lider = st.selectbox("Promover encarregado a líder:", encarregados_nao_lideres)
-            if st.button(f"Promover {novo_lider}"):
-                if adicionar_coluna_e_promover_lider(PLANILHA_NOTAS_NOME, PLANILHA_EQUIPES_NOME, novo_lider):
-                    st.cache_data.clear(); st.success(f"{novo_lider} promovido! A página será recarregada."); st.rerun()
-        else: st.info("Todos os encarregados já são líderes.")
-
-    st.header("Corrigir Nomes de Encarregados")
-    if df_notas is not None and df_equipes is not None:
-        nomes_unicos_notas = sorted(df_notas['Encarregado'].astype(str).unique())
-        nomes_corretos_equipe = sorted(df_equipes['Nome'].astype(str).unique())
-        nome_a_corrigir = st.selectbox("Selecione o nome com erro:", options=nomes_unicos_notas)
-        nome_correto = st.selectbox("Selecione o nome correto:", options=nomes_corretos_equipe)
-        if st.button(f"Corrigir '{nome_a_corrigir}' para '{nome_correto}'"):
-            if nome_a_corrigir and nome_correto and nome_a_corrigir != nome_correto:
-                if corrigir_nome_encarregado(PLANILHA_NOTAS_NOME, df_notas, nome_a_corrigir, nome_correto):
-                    st.cache_data.clear(); st.success("Nome corrigido! A página será recarregada."); st.rerun()
-            else: st.warning("Selecione nomes diferentes para a correção.")
-
-
-if df_notas is not None:
-    df_para_exibir = df_notas.copy()
-
-    if "Todos" not in filtro_encarregado:
-        df_para_exibir = df_para_exibir[df_para_exibir['Encarregado'].isin(filtro_encarregado)]
+    with st.form(key="login_form"):
+        username = st.text_input("Usuário")
+        password = st.text_input("Senha", type="password")
+        login_button = st.form_submit_button(label="Entrar")
         
-    if ordem_primaria and ordem_secundaria and ordem_primaria != ordem_secundaria:
-        df_para_exibir = df_para_exibir.sort_values(by=[ordem_primaria, ordem_secundaria])
+        if login_button:
+            with st.spinner("Verificando..."):
+                if check_credentials(username, password):
+                    st.session_state.authenticated = True
+                    st.rerun()
+                else:
+                    st.error("Usuário ou senha inválidos.")
 
-    with col_botao:
-        st.write("") 
-        st.write("")
-        excel_data = gerar_arquivo_excel(df_para_exibir, df_notas, lideres, df_equipes)
-        st.download_button(
-            label="🖨️ Imprimir Relatório",
-            data=excel_data,
-            file_name=f"relatorio_tarefas_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    
-    st.markdown("---")
-    st.header("Editor de Notas")
-    st.info("Clique nas células para editar. Apenas as colunas de 'Peso' e dos líderes são editáveis.")
-    
-    colunas_editaveis = ['Peso'] + lideres
-    colunas_desabilitadas = [col for col in df_para_exibir.columns if col not in colunas_editaveis]
-    
-    df_editado = st.data_editor(
-        df_para_exibir, 
-        disabled=colunas_desabilitadas,
-        key="editor_notas",
-        column_config={
-            "Link": st.column_config.LinkColumn(
-                "Link da Tarefa",
-                display_text="Abrir ↗"
+# --- APLICAÇÃO PRINCIPAL (SE LOGADO) ---
+else:
+    col_titulo, col_botao = st.columns([3, 1])
+    with col_titulo:
+        st.title("📝 Gerenciador de Notas de Tarefas")
+        st.write("Sincronize tarefas, edite notas, promova líderes e exporte relatórios.")
+
+    df_notas, df_equipes, encarregados, lideres = sincronizar_e_processar_dados()
+
+    with st.sidebar:
+        st.image("media portal logo.png", width=200)
+        st.sidebar.button("Sair / Logout", on_click=lambda: st.session_state.update(authenticated=False))
+
+        # --- BOTÃO DE ATUALIZAÇÃO DA API ADICIONADO ---
+        st.header("Sincronização Manual")
+        if st.button("🔄 Atualizar Dados do BaseCamp"):
+            with st.spinner("Buscando novas tarefas do BaseCamp..."):
+                if atualizar_basecamp_api():
+                    st.success("Planilha 'Total BaseCamp' atualizada com sucesso!")
+                    st.info("Limpando cache e recarregando o aplicativo para sincronizar as notas...")
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error("Falha ao buscar dados do BaseCamp.")
+        
+        st.header("Filtros e Ordenação")
+        
+        status_filtro = st.selectbox("Filtrar por Status do Encarregado:", ["Todos", "Ativos", "Desativados", "Não Listados"])
+
+        nomes_para_filtrar = []
+        if df_equipes is not None and df_notas is not None:
+            if status_filtro == 'Todos': nomes_para_filtrar = encarregados
+            elif status_filtro == 'Ativos':
+                nomes_ativos = df_equipes[df_equipes['Status'] == 'Ativo']['Nome'].tolist()
+                nomes_para_filtrar = [nome for nome in encarregados if nome in nomes_ativos]
+            elif status_filtro == 'Desativados':
+                nomes_desativados = df_equipes[df_equipes['Status'] == 'Desativado']['Nome'].tolist()
+                nomes_para_filtrar = [nome for nome in encarregados if nome in nomes_desativados]
+            elif status_filtro == 'Não Listados':
+                nomes_listados = df_equipes['Nome'].tolist()
+                nomes_para_filtrar = [nome for nome in encarregados if nome not in nomes_listados]
+        
+        filtro_encarregado = st.multiselect("Filtrar por Encarregado:", ["Todos"] + sorted(nomes_para_filtrar), default="Todos")
+        
+        st.write("Ordenar por:")
+        opcoes_ordem = ['Encarregado', 'Data Inicial', 'Data Final', 'Tarefa']
+        ordem_primaria = st.selectbox("Fator Primário:", opcoes_ordem, index=0)
+        ordem_secundaria = st.selectbox("Fator Secundário:", opcoes_ordem, index=1)
+        
+        st.header("Gerenciar Líderes")
+        
+        if df_notas is not None and df_equipes is not None:
+            encarregados_nao_lideres = sorted(list(set(encarregados) - set(lideres)))
+            if encarregados_nao_lideres:
+                novo_lider = st.selectbox("Promover encarregado a líder:", encarregados_nao_lideres)
+                if st.button(f"Promover {novo_lider}"):
+                    if adicionar_coluna_e_promover_lider(PLANILHA_NOTAS_NOME, PLANILHA_EQUIPES_NOME, novo_lider):
+                        st.cache_data.clear(); st.success(f"{novo_lider} promovido! A página será recarregada."); st.rerun()
+            else: st.info("Todos os encarregados já são líderes.")
+
+        st.header("Corrigir Nomes de Encarregados")
+        if df_notas is not None and df_equipes is not None:
+            nomes_unicos_notas = sorted(df_notas['Encarregado'].astype(str).unique())
+            nomes_corretos_equipe = sorted(df_equipes['Nome'].astype(str).unique())
+            nome_a_corrigir = st.selectbox("Selecione o nome com erro:", options=nomes_unicos_notas)
+            nome_correto = st.selectbox("Selecione o nome correto:", options=nomes_corretos_equipe)
+            if st.button(f"Corrigir '{nome_a_corrigir}' para '{nome_correto}'"):
+                if nome_a_corrigir and nome_correto and nome_a_corrigir != nome_correto:
+                    if corrigir_nome_encarregado(PLANILHA_NOTAS_NOME, df_notas, nome_a_corrigir, nome_correto):
+                        st.cache_data.clear(); st.success("Nome corrigido! A página será recarregada."); st.rerun()
+                else: st.warning("Selecione nomes diferentes para a correção.")
+
+    # O resto da lógica principal só é executado se os dados foram carregados
+    if df_notas is not None:
+        df_para_exibir = df_notas.copy()
+
+        if "Todos" not in filtro_encarregado:
+            df_para_exibir = df_para_exibir[df_para_exibir['Encarregado'].isin(filtro_encarregado)]
+            
+        if ordem_primaria and ordem_secundaria and ordem_primaria != ordem_secundaria:
+            df_para_exibir = df_para_exibir.sort_values(by=[ordem_primaria, ordem_secundaria])
+
+        with col_botao:
+            st.write("") 
+            st.write("")
+            excel_data = gerar_arquivo_excel(df_para_exibir, df_notas, lideres, df_equipes)
+            st.download_button(
+                label="🖨️ Imprimir Relatório",
+                data=excel_data,
+                file_name=f"relatorio_tarefas_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        }
-    )
-    
-    st.markdown("---")
-    
-    if st.button("Salvar Alterações na Planilha Google", type="primary"):
-        with st.spinner("Salvando..."):
-            df_atualizado = df_notas.copy()
-            df_atualizado['ID'] = df_atualizado['ID'].astype(str)
-            df_editado['ID'] = df_editado['ID'].astype(str)
-            df_atualizado.set_index('ID', inplace=True)
-            df_editado.set_index('ID', inplace=True)
-            df_atualizado.update(df_editado)
-            df_atualizado.reset_index(inplace=True)
-            df_atualizado = df_atualizado[df_atualizado['ID'] != '']
-            if salvar_df_na_aba(PLANILHA_NOTAS_NOME, df_atualizado):
-                st.cache_data.clear()
-                st.success("Alterações salvas! A página será recarregada."); 
-                st.rerun()
-            else: 
-                st.error("Houve um erro ao salvar.")
+        
+        st.markdown("---")
+        st.header("Editor de Notas")
+        st.info("Clique nas células para editar. Apenas as colunas de 'Peso' e dos líderes são editáveis.")
+        
+        colunas_editaveis = ['Peso'] + lideres
+        colunas_desabilitadas = [col for col in df_para_exibir.columns if col not in colunas_editaveis]
+        
+        df_editado = st.data_editor(
+            df_para_exibir, 
+            disabled=colunas_desabilitadas,
+            key="editor_notas",
+            # --- CONFIGURAÇÃO DA COLUNA "Link" ---
+            column_config={
+                "Link": st.column_config.LinkColumn(
+                    "Link da Tarefa",
+                    display_text="Abrir ↗"
+                )
+            }
+        )
+        
+        st.markdown("---")
+        
+        if st.button("Salvar Alterações na Planilha Google", type="primary"):
+            with st.spinner("Salvando..."):
+                df_atualizado = df_notas.copy()
+                df_atualizado['ID'] = df_atualizado['ID'].astype(str)
+                df_editado['ID'] = df_editado['ID'].astype(str)
+                df_atualizado.set_index('ID', inplace=True)
+                df_editado.set_index('ID', inplace=True)
+                df_atualizado.update(df_editado)
+                df_atualizado.reset_index(inplace=True)
+                df_atualizado = df_atualizado[df_atualizado['ID'] != '']
+                if salvar_df_na_aba(PLANILHA_NOTAS_NOME, df_atualizado):
+                    st.cache_data.clear()
+                    st.success("Alterações salvas! A página será recarregada."); 
+                    st.rerun()
+                else: 
+                    st.error("Houve um erro ao salvar.")
