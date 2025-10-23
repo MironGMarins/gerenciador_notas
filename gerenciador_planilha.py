@@ -332,13 +332,16 @@ def gerar_arquivo_excel(df_geral, df_completo, lideres, df_equipes):
             start_row_total = start_row_pontos + len(df_pontos_lideranca_filtrado) + 4
             pontuacao_total_filtrado.to_excel(writer, sheet_name='Soma Geral', index=False, startrow=start_row_total)
 
+        # --- Aba 3: Soma Semanal ---
         df_semanal = df_calculo.copy()
         df_semanal = df_semanal[pd.notna(df_semanal['Data Final'])]
         
         if not df_semanal.empty:
-            start_date = pd.to_datetime("2025-07-04")
-            df_semanal['Semana_dt'] = df_semanal['Data Final'].apply(lambda x: start_date + pd.to_timedelta(((x - start_date).days // 7) * 7, unit='d'))
+            # --- CORREÇÃO DA LÓGICA SEMANAL ---
+            # Define a semana pela SEXTA-FEIRA em que ela termina (dia da semana = 4)
+            df_semanal['Semana_dt'] = df_semanal['Data Final'].apply(lambda x: x + pd.to_timedelta((4 - x.dayofweek + 7) % 7, unit='d'))
             df_semanal['Semana'] = df_semanal['Semana_dt'].dt.strftime('%d/%m/%Y')
+            
             sorted_weeks = sorted(df_semanal['Semana'].unique(), key=lambda d: pd.to_datetime(d, format='%d/%m/%Y'))
 
             pivot_peso = df_semanal.pivot_table(index='Encarregado', columns='Semana', values='Peso', aggfunc='sum').fillna(0)
