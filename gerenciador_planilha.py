@@ -7,6 +7,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import io
 import requests # Adicionado para chamadas de API
+import numpy as np # Adicionado para np.where e outros
 
 # ==============================================================================
 # CONFIGURAÇÃO DA PÁGINA
@@ -43,15 +44,31 @@ def autorizar_cliente():
 # FUNÇÃO AUXILIAR DE CARREGAMENTO ROBUSTO
 # ==============================================================================
 def carregar_aba_de_forma_robusta(worksheet):
-    """Carrega uma aba mesmo que ela tenha cabeçalhos duplicados."""
+    """Carrega uma aba mesmo que ela tenha cabeçalhos duplicados ou esteja vazia."""
     all_values = worksheet.get_all_values()
     if not all_values:
+        # Retorna DataFrame vazio com colunas se a aba tiver só cabeçalho
+        try:
+            headers = worksheet.row_values(1)
+            if headers:
+                return pd.DataFrame(columns=headers)
+        except Exception:
+            pass # Ignora se não conseguir ler nem o cabeçalho
         return pd.DataFrame()
     
     headers = all_values[0]
     data = all_values[1:]
     
-    return pd.DataFrame(data, columns=headers)
+    # Tratamento para cabeçalhos duplicados (adiciona sufixo)
+    cols = pd.Series(headers)
+    for dup in cols[cols.duplicated()].unique():
+        cols[cols[cols == dup].index.values.tolist()] = [dup + '.' + str(i) if i != 0 else dup for i in range(sum(cols == dup))]
+    
+    df = pd.DataFrame(data, columns=cols)
+    # Remove colunas que são totalmente vazias (sem nome de cabeçalho)
+    df = df.loc[:, df.columns.notna() & (df.columns != '')]
+    return df
+
 
 # ==============================================================================
 # --- FUNÇÃO DE LOGIN (ATUALIZADA PARA RETORNAR A FUNÇÃO/STATUS) ---
@@ -70,6 +87,8 @@ def check_credentials(username, password):
             
         spreadsheet = client.open_by_url(url_da_planilha)
         ws_senhas = spreadsheet.worksheet(PLANILHA_SENHAS_NOME)
+        
+        # Usa get_all_records para simplicidade, já que a aba Senhas é controlada
         df_senhas = pd.DataFrame(ws_senhas.get_all_records())
         
         username = str(username).strip()
@@ -148,16 +167,25 @@ def _carregar_dados_brutos():
         st.error("A URL da planilha (SHEET_URL) não foi encontrada nos segredos do Streamlit.")
         return None, None, None
 
-    spreadsheet = client.open_by_url(url_da_planilha)
-    ws_origem = spreadsheet.worksheet(PLANILHA_ORIGEM_NOME)
-    ws_notas = spreadsheet.worksheet(PLANILHA_NOTAS_NOME)
-    ws_equipes = spreadsheet.worksheet(PLANILHA_EQUIPES_NOME)
+    try:
+        spreadsheet = client.open_by_url(url_da_planilha)
+        ws_origem = spreadsheet.worksheet(PLANILHA_ORIGEM_NOME)
+        ws_notas = spreadsheet.worksheet(PLANILHA_NOTAS_NOME)
+        ws_equipes = spreadsheet.worksheet(PLANILHA_EQUIPES_NOME)
 
-    df_origem = carregar_aba_de_forma_robusta(ws_origem)
-    df_notas = carregar_aba_de_forma_robusta(ws_notas)
-    df_equipes = carregar_aba_de_forma_robusta(ws_equipes)
-    
-    return df_origem, df_notas, df_equipes
+        df_origem = carregar_aba_de_forma_robusta(ws_origem)
+        df_notas = carregar_aba_de_forma_robusta(ws_notas)
+        df_equipes = carregar_aba_de_forma_robusta(ws_equipes)
+        
+        return df_origem, df_notas, df_equipes
+        
+    except gspread.exceptions.WorksheetNotFound as e:
+        st.error(f"Erro Crítico: Aba não encontrada: {e}")
+        return None, None, None
+    except Exception as e:
+        st.error(f"Erro ao carregar dados brutos: {e}")
+        return None, None, None
+
 
 def salvar_df_na_aba(aba_nome, df, show_success=True):
     """Função robusta para salvar: obtém uma nova conexão."""
@@ -172,6 +200,11 @@ def salvar_df_na_aba(aba_nome, df, show_success=True):
         worksheet = spreadsheet.worksheet(aba_nome)
 
         df_filled = df.fillna('')
+        
+        # *** MUDANÇA: Converter datas para string no formato PT-BR antes de salvar ***
+        for col in df_filled.select_dtypes(include=['datetime', 'datetimetz']).columns:
+             df_filled[col] = df_filled[col].dt.strftime('%d/%m/%Y')
+             
         df_list = [df_filled.columns.values.tolist()] + df_filled.astype(str).values.tolist()
         worksheet.clear()
         worksheet.update(df_list, value_input_option='USER_ENTERED')
@@ -187,19 +220,39 @@ def sincronizar_e_processar_dados():
     """Usa dados em cache para processar, sincronizar e retornar os DataFrames finais."""
     try:
         df_origem, df_notas, df_equipes = _carregar_dados_brutos()
-        if df_notas is None: return None, None, None, None
+        
+        # Verifica se o carregamento falhou
+        if df_notas is None or df_origem is None or df_equipes is None:
+             st.error("Falha ao carregar uma ou mais abas. Sincronização cancelada.")
+             return None, None, None, None
 
         if 'Encarregado' in df_origem.columns: df_origem['Encarregado'] = df_origem['Encarregado'].astype(str)
         if 'Encarregado' in df_notas.columns: df_notas['Encarregado'] = df_notas['Encarregado'].astype(str).str.strip()
         if 'Nome' in df_equipes.columns: df_equipes['Nome'] = df_equipes['Nome'].astype(str).str.strip()
 
-        for col in ['Data Inicial', 'Data Final', 'Data Estipulada']:
-            if col in df_notas.columns: df_notas[col] = pd.to_datetime(df_notas[col], errors='coerce')
+        # ==================================================================
+        # --- MUDANÇA: Conversão de data robusta ---
+        # ==================================================================
+        colunas_data = ['Data Inicial', 'Data Final', 'Data Estipulada']
+        for col in colunas_data:
+            if col in df_notas.columns:
+                # Substitui vazios ('', 'None') por Nulo
+                df_notas[col] = df_notas[col].replace(['', 'None', None, 'nan'], pd.NA)
+                # Converte para datetime, assumindo que o dia vem primeiro (ex: 31/12/2025)
+                df_notas[col] = pd.to_datetime(df_notas[col], dayfirst=True, errors='coerce')
+            else:
+                # Garante que a coluna exista se estiver faltando, para evitar erros
+                df_notas[col] = pd.NaT 
+        # ==================================================================
 
         if 'Link' in df_origem.columns and 'Link' in df_notas.columns:
             df_origem['ID'] = df_origem['Link'].str.split('/').str[-1].fillna('').astype(str)
             df_notas['ID'] = df_notas['Link'].str.split('/').str[-1].fillna('').astype(str)
-        
+        else:
+             st.error("Coluna 'Link' não encontrada nas abas 'Origem' ou 'Notas'. A sincronização de IDs não pode ser feita.")
+             df_origem['ID'] = None
+             df_notas['ID'] = None
+
         df_notas.dropna(subset=['ID'], inplace=True); df_notas = df_notas[df_notas['ID'] != '']
         if df_notas['ID'].duplicated().any(): df_notas.drop_duplicates(subset=['ID'], keep='first', inplace=True, ignore_index=True)
 
@@ -214,6 +267,13 @@ def sincronizar_e_processar_dados():
                 for col in df_notas.columns:
                     if col not in novas_tarefas_df.columns: novas_tarefas_df[col] = ''
                 novas_tarefas_df = novas_tarefas_df[df_notas.columns.tolist()]
+                
+                # *** Adiciona a mesma conversão de data robusta para as novas tarefas ***
+                for col in colunas_data:
+                    if col in novas_tarefas_df.columns:
+                        novas_tarefas_df[col] = novas_tarefas_df[col].replace(['', 'None', None, 'nan'], pd.NA)
+                        novas_tarefas_df[col] = pd.to_datetime(novas_tarefas_df[col], dayfirst=True, errors='coerce')
+
                 df_notas_atualizado = pd.concat([df_notas, novas_tarefas_df], ignore_index=True)
                 if salvar_df_na_aba(PLANILHA_NOTAS_NOME, df_notas_atualizado, show_success=False):
                     st.cache_data.clear(); st.rerun()
@@ -227,9 +287,19 @@ def sincronizar_e_processar_dados():
         
         encarregados = sorted(df_notas['Encarregado'].astype(str).unique())
         
+        # ==================================================================
+        # --- MUDANÇA: Conversão numérica robusta ---
+        # ==================================================================
         colunas_de_notas = ['Peso'] + lideres
         for col in colunas_de_notas:
-            if col in df_notas.columns: df_notas[col] = pd.to_numeric(df_notas[col], errors='coerce')
+            if col in df_notas.columns:
+                # Substitui vírgula por ponto (para decimais ex: 1,5 -> 1.5)
+                df_notas[col] = df_notas[col].astype(str).str.replace(',', '.', regex=False)
+                # Substitui vazios ('', 'None') por Nulo
+                df_notas[col] = df_notas[col].replace(['', 'None', None, 'nan'], pd.NA)
+                # Converte para numérico
+                df_notas[col] = pd.to_numeric(df_notas[col], errors='coerce').fillna(0)
+        # ==================================================================
         
         return df_notas, df_equipes, encarregados, lideres
 
@@ -246,26 +316,35 @@ def adicionar_coluna_e_promover_lider(aba_notas_nome, aba_equipes_nome, nome_lid
         
     spreadsheet = client.open_by_url(url_da_planilha)
     ws_notas = spreadsheet.worksheet(aba_notas_nome)
-    df_notas = pd.DataFrame(ws_notas.get_all_records())
+    
+    # Usa get_all_values para ser consistente
+    notas_valores = ws_notas.get_all_values()
+    headers_notas = notas_valores[0] if notas_valores else []
 
-    if nome_lider not in df_notas.columns:
+    if nome_lider not in headers_notas:
         try:
             ws_notas.add_cols(1)
-            nova_coluna_index = len(df_notas.columns) + 1
+            nova_coluna_index = len(headers_notas) + 1
             ws_notas.update_cell(1, nova_coluna_index, nome_lider)
         except Exception as e:
             st.error(f"Não foi possível adicionar a coluna: {e}"); return False
     
     try:
         ws_equipes = spreadsheet.worksheet(aba_equipes_nome)
-        cell = ws_equipes.find(nome_lider, in_column=1)
+        cell = ws_equipes.find(nome_lider, in_column=1) # Procura na coluna 1 (Nome)
         if cell:
-            headers = ws_equipes.row_values(1)
-            if "Posição" in headers:
-                posicao_col_index = headers.index("Posição") + 1
+            headers_equipe = ws_equipes.row_values(1)
+            if "Posição" in headers_equipe:
+                posicao_col_index = headers_equipe.index("Posição") + 1
                 ws_equipes.update_cell(cell.row, posicao_col_index, "Lider")
                 st.toast(f"👑 {nome_lider} promovido a Líder com sucesso!"); return True
-        return False
+            else:
+                st.error("Coluna 'Posição' não encontrada na aba 'Equipes'.")
+                return False
+        else:
+            st.warning(f"'{nome_lider}' não encontrado na aba 'Equipes'. Coluna adicionada em 'Notas', mas 'Posição' não atualizada.")
+            return True # Retorna True porque a coluna foi adicionada, mesmo que a posição não
+            
     except Exception as e:
         st.error(f"Não foi possível atualizar a posição do líder: {e}"); return False
 
@@ -283,7 +362,7 @@ def gerar_arquivo_excel(df_geral, df_completo, lideres, df_equipes):
     """Gera um arquivo Excel em memória com 3 abas de relatório."""
     output = io.BytesIO()
     
-    if df_equipes is not None and not df_equipes.empty:
+    if df_equipes is not None and not df_equipes.empty and 'Status' in df_equipes.columns and 'Nome' in df_equipes.columns:
         nomes_ativos = df_equipes[df_equipes['Status'] == 'Ativo']['Nome'].tolist()
         nomes_ativos_lower = {str(nome).lower() for nome in nomes_ativos}
     else:
@@ -291,13 +370,17 @@ def gerar_arquivo_excel(df_geral, df_completo, lideres, df_equipes):
         nomes_ativos_lower = {str(nome).lower() for nome in nomes_ativos}
 
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_completo.to_excel(writer, sheet_name='Relatório Geral', index=False)
+        
+        # --- Aba 1: Relatório Geral (Já formatado) ---
+        df_completo_excel = df_completo.copy()
+        # Converte datas para string para salvar no Excel (evita problemas de timezone)
+        for col in df_completo_excel.select_dtypes(include=['datetime', 'datetimetz']).columns:
+            df_completo_excel[col] = df_completo_excel[col].dt.strftime('%d/%m/%Y')
+        df_completo_excel.to_excel(writer, sheet_name='Relatório Geral', index=False)
 
-        df_calculo = df_completo.copy()
-        colunas_de_notas = ['Peso'] + lideres
-        for col in colunas_de_notas:
-            if col in df_calculo.columns:
-                df_calculo[col] = pd.to_numeric(df_calculo[col], errors='coerce')
+        # --- Aba 2: Soma Geral ---
+        # df_completo já vem com números convertidos de sincronizar_e_processar_dados()
+        df_calculo = df_completo.copy() 
 
         soma_peso_geral = df_calculo.groupby('Encarregado')['Peso'].sum().reset_index()
         soma_peso_geral_filtrado = soma_peso_geral[soma_peso_geral['Encarregado'].str.lower().isin(nomes_ativos_lower)]
@@ -310,6 +393,7 @@ def gerar_arquivo_excel(df_geral, df_completo, lideres, df_equipes):
         for lider_lower in lideres_lower:
             if lider_lower in colunas_df_lower:
                 lider_col_original = colunas_df_lower[lider_lower]
+                # Os dados já são numéricos, fillna(0) é suficiente
                 pontos = df_calculo[lider_col_original].fillna(0).sum()
                 df_pontos_lideranca.append({'Líder': lider_col_original, 'Pontos por Liderança': pontos})
 
@@ -334,6 +418,7 @@ def gerar_arquivo_excel(df_geral, df_completo, lideres, df_equipes):
 
         # --- Aba 3: Soma Semanal ---
         df_semanal = df_calculo.copy()
+        # 'Data Final' já é datetime graças à sincronização
         df_semanal = df_semanal[pd.notna(df_semanal['Data Final'])]
         
         if not df_semanal.empty:
@@ -349,9 +434,7 @@ def gerar_arquivo_excel(df_geral, df_completo, lideres, df_equipes):
             pivot_peso_filtrado = pivot_peso_filtrado.reindex(columns=sorted_weeks, fill_value=0)
             pivot_peso_filtrado.to_excel(writer, sheet_name='Soma Semanal', startrow=0)
             
-            for lider_col in lideres:
-                if lider_col in df_semanal.columns:
-                    df_semanal[lider_col] = pd.to_numeric(df_semanal[lider_col], errors='coerce').fillna(0)
+            # 'lideres' já são colunas numéricas
             df_semanal['Pontos de Liderança'] = df_semanal[lideres].sum(axis=1)
             pivot_lideranca = df_semanal.pivot_table(index='Encarregado', columns='Semana', values='Pontos de Liderança', aggfunc='sum').fillna(0)
             pivot_lideranca_filtrado = pivot_lideranca[pivot_lideranca.index.str.lower().isin(nomes_ativos_lower)]
@@ -477,7 +560,14 @@ else:
             df_para_exibir = df_para_exibir[df_para_exibir['Encarregado'].isin(filtro_encarregado)]
             
         if ordem_primaria and ordem_secundaria and ordem_primaria != ordem_secundaria:
-            df_para_exibir = df_para_exibir.sort_values(by=[ordem_primaria, ordem_secundaria])
+            # Garante que a ordenação não falhe se as colunas tiverem Nulos (NaT)
+            try:
+                df_para_exibir = df_para_exibir.sort_values(by=[ordem_primaria, ordem_secundaria], na_position='last')
+            except TypeError as e:
+                st.warning(f"Não foi possível ordenar por {ordem_primaria} ou {ordem_secundaria}. Pode haver tipos de dados mistos. {e}")
+                # Ordena por string como fallback
+                df_para_exibir = df_para_exibir.astype(str).sort_values(by=[ordem_primaria, ordem_secundaria])
+
 
         with col_botao:
             st.write("") 
@@ -512,7 +602,14 @@ else:
                 "Link": st.column_config.LinkColumn(
                     "Link da Tarefa",
                     display_text="Abrir ↗"
-                )
+                ),
+                # Formata as colunas de data para exibição PT-BR
+                "Data Inicial": st.column_config.DateColumn("Data Inicial", format="DD/MM/YYYY"),
+                "Data Final": st.column_config.DateColumn("Data Final", format="DD/MM/YYYY"),
+                "Data Estipulada": st.column_config.DateColumn("Data Estipulada", format="DD/MM/YYYY"),
+                # Formata colunas numéricas
+                "Peso": st.column_config.NumberColumn("Peso", format="%0.2f"),
+                **{lider: st.column_config.NumberColumn(lider, format="%0.2f") for lider in lideres}
             }
         )
         
@@ -523,16 +620,26 @@ else:
             if st.button("Salvar Alterações na Planilha Google", type="primary"):
                 with st.spinner("Salvando..."):
                     df_atualizado = df_notas.copy()
+                    
+                    # Garante que os IDs são strings para o merge (update)
                     df_atualizado['ID'] = df_atualizado['ID'].astype(str)
                     df_editado['ID'] = df_editado['ID'].astype(str)
+                    
                     df_atualizado.set_index('ID', inplace=True)
-                    df_editado.set_index('ID', inplace=True)
-                    df_atualizado.update(df_editado)
+                    df_editado_idx = df_editado.set_index('ID')
+                    
+                    # Atualiza apenas as colunas que foram editadas
+                    df_atualizado.update(df_editado_idx[colunas_editaveis])
+                    
                     df_atualizado.reset_index(inplace=True)
                     df_atualizado = df_atualizado[df_atualizado['ID'] != '']
+                    
                     if salvar_df_na_aba(PLANILHA_NOTAS_NOME, df_atualizado):
                         st.cache_data.clear()
                         st.success("Alterações salvas! A página será recarregada."); 
                         st.rerun()
                     else: 
                         st.error("Houve um erro ao salvar.")
+    else:
+        st.error("Não foi possível carregar os dados das planilhas.")
+        st.info("Verifique as permissões, nomes das abas e se a URL da planilha está correta nos segredos.")
