@@ -20,8 +20,8 @@ st.set_page_config(
 # ==============================================================================
 # CONSTANTES
 # ==============================================================================
-PLANILHA_ORIGEM_NOME = "Total BaseCamp Consolidado" 
-PLANILHA_CONSOLIDADA_NOME = "Total BaseCamp para Notas" 
+PLANILHA_ORIGEM_NOME = "Total BaseCamp Consolidado" # Origem dos dados brutos
+PLANILHA_CONSOLIDADA_NOME = "Total BaseCamp para Notas" # Destino da consolidação (Dashboard)
 PLANILHA_BACKLOG_NOME = "Backlog"
 PLANILHA_EQUIPES_NOME = "Equipes"
 PLANILHA_SENHAS_NOME = "Senhas"
@@ -71,23 +71,9 @@ def regenerar_id_pelo_link(df):
     return df
 
 def converter_data_robusta(series):
-    """
-    Versão ultra-robusta para lidar com formatos mistos e lixo.
-    """
-    # 1. Força string e remove espaços nas pontas
-    s = series.astype(str).str.strip()
-    
-    # 2. Remove valores nulos/inválidos conhecidos
-    # Remove também caracteres invisíveis ou timestamps colados (ex: '2025-12-01T00:00:00')
-    s = s.replace(['nan', 'None', '', 'NaT', '0', '#N/A', '-'], np.nan)
-    
-    # 3. Tenta converter com dayfirst=True (padrão BR: 01/12 = 1 Dez)
-    # mixed permite que o pandas adivinhe formato linha a linha se houver mistura
-    # (Disponível em versões mais novas do pandas, senão fallback para coerce simples)
-    try:
-        return pd.to_datetime(s, dayfirst=True, errors='coerce', format='mixed')
-    except:
-        return pd.to_datetime(s, dayfirst=True, errors='coerce')
+    series = series.astype(str).str.strip()
+    series = series.replace(['nan', 'None', '', 'NaT', '0', '#N/A'], np.nan)
+    return pd.to_datetime(series, dayfirst=True, errors='coerce')
 
 # ==============================================================================
 # CONEXÃO E CACHE
@@ -150,8 +136,9 @@ def check_credentials(username, password):
 # ==============================================================================
 def sincronizar_basecamp_com_mes_especifico(nome_aba_destino):
     """
-    Copia dados da Planilha Base para uma aba de mês específica.
+    Copia dados da Planilha Base (Total BaseCamp Consolidado) para uma aba de mês específica.
     IGNORA tarefas [ARCHIVED].
+    Mantém filtro de datas para popular a aba do mês corretamente (Mês Atual vs Histórico).
     """
     spreadsheet = obter_spreadsheet_cacheada()
     
@@ -179,7 +166,7 @@ def sincronizar_basecamp_com_mes_especifico(nome_aba_destino):
         try: ws_destino = spreadsheet.add_worksheet(title=nome_aba_destino, rows=1000, cols=30)
         except Exception as e: return f"Erro criar aba: {e}"
 
-    # Lógica de Datas
+    # Lógica de Datas para popular a aba do mês
     if 'Data Final' in df_origem.columns:
         df_origem['Data_Obj'] = converter_data_robusta(df_origem['Data Final'])
         hoje = datetime.now()
@@ -212,17 +199,25 @@ def sincronizar_basecamp_com_mes_especifico(nome_aba_destino):
     except Exception as e: return f"Erro salvar: {e}"
 
 def atualizar_aba_backlog():
+    """
+    Lê a origem, IGNORA ARQUIVADAS, filtra 'Backlog' na coluna Lista e salva.
+    """
     spreadsheet = obter_spreadsheet_cacheada()
+    
     try:
         ws_origem = spreadsheet.worksheet(PLANILHA_ORIGEM_NOME)
         df_origem = carregar_aba_robusta(ws_origem)
     except: return f"Aba Origem '{PLANILHA_ORIGEM_NOME}' não encontrada."
+    
     if df_origem.empty: return "Origem vazia."
+    
     df_origem.columns = df_origem.columns.astype(str).str.strip()
+    
     if 'Lista' not in df_origem.columns: return "Coluna 'Lista' não encontrada na origem."
 
     # --- FILTRO DE EXCLUSÃO DE ARQUIVADAS ---
     df_origem = df_origem[~df_origem['Lista'].astype(str).str.contains("\[ARCHIVED\]", case=False, regex=True, na=False)]
+    # ----------------------------------------
         
     # Filtra Backlog
     mask_backlog = df_origem['Lista'].astype(str).str.contains("Backlog", case=False, na=False)
@@ -237,24 +232,26 @@ def atualizar_aba_backlog():
             ws_backlog.clear()
         except gspread.exceptions.WorksheetNotFound:
             ws_backlog = spreadsheet.add_worksheet(title=PLANILHA_BACKLOG_NOME, rows=1000, cols=30)
+            
         ws_backlog.update([df_backlog.columns.values.tolist()] + df_backlog.astype(str).values.tolist(), value_input_option='USER_ENTERED')
         return f"Sucesso! {len(df_backlog)} tarefas no Backlog."
     except Exception as e: return f"Erro ao salvar Backlog: {e}"
 
 def consolidar_geral_para_dashboard():
     """
-    Consolida todas as abas de MESES.
-    IGNORA tarefas marcadas como [ARCHIVED] na coluna Lista.
+    Consolida TODAS as abas de MESES em um 'Mapa Histórico'.
+    Lógica: EMPILHAMENTO SIMPLES (SNAPSHOT).
+    - Ignora datas (assume que se está na aba do mês, pertence àquele histórico).
+    - Permite repetições (mesma tarefa pode aparecer em Nov e Dez para mostrar evolução).
+    - Remove [ARCHIVED] para limpeza.
     """
     spreadsheet = obter_spreadsheet_cacheada()
     all_worksheets = spreadsheet.worksheets()
     dfs = []
-    hoje = datetime.now()
     
     for ws in all_worksheets:
         mes_ano = extrair_mes_ano_da_aba(ws.title)
         if mes_ano:
-            mes_alvo, ano_alvo = mes_ano
             time.sleep(1.5)
             
             df_mes = carregar_aba_robusta(ws)
@@ -265,37 +262,14 @@ def consolidar_geral_para_dashboard():
             # --- FILTRO DE EXCLUSÃO DE ARQUIVADAS ---
             if 'Lista' in df_mes.columns:
                 df_mes = df_mes[~df_mes['Lista'].astype(str).str.contains("\[ARCHIVED\]", case=False, regex=True, na=False)]
-            # -----------------------------------------
             
-            if 'Data Final' in df_mes.columns:
-                df_mes['Data_Obj'] = converter_data_robusta(df_mes['Data Final'])
-                
-                eh_mes_atual = (mes_alvo == hoje.month) and (ano_alvo == hoje.year)
-                
-                if eh_mes_atual:
-                    # Mês Atual: Data no Mês OU Sem Data
-                    condicao = (
-                        ((df_mes['Data_Obj'].dt.month == mes_alvo) & (df_mes['Data_Obj'].dt.year == ano_alvo)) |
-                        (df_mes['Data_Obj'].isna())
-                    )
-                    tipo_fonte = "Mês Atual"
-                else:
-                    # Meses Passados: APENAS tarefas com data naquele mês
-                    condicao = (df_mes['Data_Obj'].dt.month == mes_alvo) & (df_mes['Data_Obj'].dt.year == ano_alvo)
-                    tipo_fonte = f"Histórico: {ws.title}"
-                
-                df_filtrado = df_mes[condicao].copy()
-                
-                if not df_filtrado.empty:
-                    df_filtrado['Fonte_Dados'] = tipo_fonte
-                    df_filtrado = df_filtrado.drop(columns=['Data_Obj'])
-                    dfs.append(df_filtrado)
-            else:
-                 if (mes_alvo == hoje.month) and (ano_alvo == hoje.year):
-                    df_mes['Fonte_Dados'] = "Mês Atual (Sem Data)"
-                    dfs.append(df_mes)
+            # Identifica a fonte do snapshot (ex: "Snapshot: Novembro 2024")
+            df_mes['Fonte_Dados'] = f"Snapshot: {ws.title}"
+            
+            # ADICIONA AO CONSOLIDADO SEM FILTRO DE DATA
+            dfs.append(df_mes)
 
-    if not dfs: return "Nenhum dado encontrado para consolidar."
+    if not dfs: return "Nenhum dado (aba mensal) encontrado para consolidar."
 
     df_final = pd.concat(dfs, ignore_index=True)
     cols_drop = obter_lista_colunas_para_remover(spreadsheet)
@@ -309,10 +283,14 @@ def consolidar_geral_para_dashboard():
         df_save = df_final
         df_list = [df_save.columns.values.tolist()] + df_save.astype(str).values.tolist()
         ws_final.update(df_list, value_input_option='USER_ENTERED')
-        return f"Sucesso! {len(df_save)} tarefas consolidadas na aba '{PLANILHA_CONSOLIDADA_NOME}'."
+        return f"Sucesso! {len(df_save)} tarefas consolidadas (snapshots) na aba '{PLANILHA_CONSOLIDADA_NOME}'."
     except Exception as e: return f"Erro salvar: {e}"
 
 def atualizar_historico_diario():
+    """
+    Lê da aba 'Total BaseCamp Consolidado' e filtra pela semana atual na coluna 'Lista'.
+    IGNORA tarefas arquivadas.
+    """
     try:
         hoje = pd.Timestamp.now().normalize()
         inicio_sem = hoje - timedelta(days=hoje.dayofweek)
@@ -330,9 +308,8 @@ def atualizar_historico_diario():
 
         if 'Lista' not in df_src.columns: return "Coluna 'Lista' ausente."
 
-        # --- FILTRO DE EXCLUSÃO DE ARQUIVADAS ---
+        # Ignora Arquivadas
         df_src = df_src[~df_src['Lista'].astype(str).str.contains("\[ARCHIVED\]", case=False, regex=True, na=False)]
-        # ----------------------------------------
             
         # Filtra pela Lista da Semana
         df_semana = df_src[df_src['Lista'].astype(str).str.contains(data_ref_lista_str, na=False, regex=False)]
@@ -387,9 +364,10 @@ def deletar_tarefa_global(id_del):
     except: return False
 
 # ==============================================================================
-# DIAGNÓSTICO (MELHORADO COM FILTRO DE ARQUIVADAS)
+# DIAGNÓSTICO (ATUALIZADO PARA MOSTRAR NÃO-VAZIAS)
 # ==============================================================================
 def diagnostico_datas(nome_aba_destino):
+    """Função para depurar dados da Origem."""
     spreadsheet = obter_spreadsheet_cacheada()
     mes_ano = extrair_mes_ano_da_aba(nome_aba_destino)
     
@@ -406,7 +384,7 @@ def diagnostico_datas(nome_aba_destino):
     df_origem = carregar_aba_robusta(ws_origem)
     st.write(f"**Linhas na Origem:** {len(df_origem)}")
     
-    # MOSTRA QUANTAS SERÃO IGNORADAS
+    # DIAGNÓSTICO DE ARQUIVADAS
     if 'Lista' in df_origem.columns:
         qtd_arq = df_origem['Lista'].astype(str).str.contains("\[ARCHIVED\]", case=False, regex=True, na=False).sum()
         st.warning(f"**Linhas detectadas como [ARCHIVED]:** {qtd_arq} (Estas serão ignoradas)")
@@ -416,6 +394,7 @@ def diagnostico_datas(nome_aba_destino):
         st.success(f"**Linhas ATIVAS (para análise):** {len(df_origem)}")
     
     if 'Data Final' in df_origem.columns:
+        # Mostra apenas valores preenchidos
         df_preenchida = df_origem[df_origem['Data Final'].astype(str).str.strip() != '']
         st.write(f"**Total de datas preenchidas (ATIVAS):** {len(df_preenchida)}")
         
@@ -423,8 +402,10 @@ def diagnostico_datas(nome_aba_destino):
             st.write("Amostra de 'Data Final' (RAW - Preenchidas):")
             st.dataframe(df_preenchida['Data Final'].head(5))
             
+            # Converte
             df_preenchida['Data_Obj'] = converter_data_robusta(df_preenchida['Data Final'])
             
+            # FALHAS DE CONVERSÃO
             falhas = df_preenchida[df_preenchida['Data_Obj'].isna()]
             if not falhas.empty:
                 st.error(f"**ERRO DE CONVERSÃO:** {len(falhas)} datas não puderam ser lidas.")
@@ -434,6 +415,7 @@ def diagnostico_datas(nome_aba_destino):
             st.write("Amostra de 'Data Final' (CONVERTIDA):")
             st.dataframe(df_preenchida['Data_Obj'].head(5))
             
+            # Verifica quantas entrariam no filtro do mês
             no_mes = df_preenchida[
                 (df_preenchida['Data_Obj'].dt.month == mes_alvo) & 
                 (df_preenchida['Data_Obj'].dt.year == ano_alvo)
@@ -445,7 +427,7 @@ def diagnostico_datas(nome_aba_destino):
                 cols_show = ['ID', 'Nome Task', 'Data Final'] if 'Nome Task' in no_mes.columns else ['ID', 'Data Final']
                 st.dataframe(no_mes[cols_show].head(5), hide_index=True)
         else:
-            st.warning("Nenhuma data preenchida encontrada nas linhas ativas.")
+            st.warning("A coluna 'Data Final' parece estar vazia em todas as linhas.")
 
         sem_data = df_origem[df_origem['Data Final'].astype(str).str.strip() == '']
         st.write(f"**Linhas SEM data (Backlog):** {len(sem_data)}")
